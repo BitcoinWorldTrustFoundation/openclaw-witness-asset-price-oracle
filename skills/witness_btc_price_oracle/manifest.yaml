@@ -1,0 +1,36 @@
+name: witness_btc_price_oracle
+description: |
+  Witness Bitcoin Mainnet Price Oracle — OpenClaw Skill
+  Extracts trustless on-chain BTC price using UTXOracle v9.1 (Multi-RPC).
+  Enforces thermodynamic entropy logic to prevent window manipulation.
+  Outputs strict uint64 format (price_cents_uint64) for Simplicity covenants.
+  Broadcasts full canonical JSON to Telegram for public auditability.
+
+version: 0.1.5
+author: oraclesimplicity
+
+permissions:
+  - network_access:
+      hosts:
+        - "mempool.space"
+        - "api.telegram.org"
+        - "rpc.ankr.com"
+        - "btc.getblock.io"
+        - "public.nownodes.io"
+  - tcp:
+      ports: [80, 443]
+  - telegram:
+      enabled: true
+      default_chat_id: ${TELEGRAM_CHAT_ID}
+  - filesystem_read:
+      paths: ["price_oracle.env"]
+  - filesystem_write:
+      paths: ["btc_price_state.json"]
+
+tags:
+  - bitcoin-mainnet
+  - price-oracle
+  - utxoracle
+  - witness-l1
+  - openclaw-skill
+  - thermodynamic-consensus

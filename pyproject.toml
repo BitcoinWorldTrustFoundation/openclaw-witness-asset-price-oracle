@@ -1,0 +1,33 @@
+[project]
+name = "openclaw-witness-asset-price-oracle"
+version = "0.2.0"
+description = "Witness-based Bitcoin L1 Price Oracle (BTC, BRC-20, Runes)"
+authors = [
+    { name = "BitcoinWorldTrustFoundation", email = "contact@bitcoinworldtrust.org" }
+]
+dependencies = [
+    "httpx>=0.27.0",
+    "asyncio>=3.4.3",
+    "tenacity>=8.4.1"
+]
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.scripts]
+openclaw-witness-oracle = "src.announcer_wrapper:main"
+openclaw-btc-only-oracle = "skills.witness_btc_price_oracle.logic:main"
+openclaw-asset-witness-oracle = "skills.witness_asset_oracle.logic:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0"
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"

@@ -1,0 +1,35 @@
+name: witness_asset_oracle
+description: |
+  Witness Asset Oracle — 100% On-Chain & Stateless.
+  Extracts BRC-20 and Runes trade data directly from Bitcoin L1 witnesses.
+  Supports Taproot (BIP-341/342) and SegWit v0 signatures.
+  Implements VWAP Median pricing and Time-Decay Circuit Breaker.
+  Zero local database dependency - extracts truth ex nihilo from the blockchain.
+
+version: 0.1.0
+author: BitcoinWorldTrustFoundation
+
+permissions:
+  - network_access:
+      hosts:
+        - "127.0.0.1"
+        - "localhost"
+        - "rpc.ankr.com"
+        - "btc.getblock.io"
+        - "public.nownodes.io"
+  - tcp:
+      ports: [8332, 80, 443]
+  - filesystem_read:
+      paths: [".env"]
+  - filesystem_write:
+      paths: ["asset_price_state.json"]
+
+tags:
+  - bitcoin-mainnet
+  - asset-witness
+  - brc-20
+  - runes
+  - stateless
+  - taproot
+  - witness-l1
+  - openclaw-skill
