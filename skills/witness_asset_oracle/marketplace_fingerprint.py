@@ -149,8 +149,6 @@ class PublicRpcAssetDecoder:
                         return total_amount
                 except Exception as e:
                     logger.error(f"Runestone parsing error: {e}")
-                    # Prototype Fallback if parsing fails
-                    if "dog" in target_ticker.lower(): return 889806
         return None
 
 class MarketplaceHeuristicParser:
@@ -188,7 +186,7 @@ class MarketplaceHeuristicParser:
             return []
 
         # Simple asset type heuristic
-        is_runes = "•" in target_ticker or len(target_ticker) > 5 or "dog" in target_ticker.lower()
+        is_runes = "•" in target_ticker or len(target_ticker) > 5 or "dog" in target_ticker.lower() or target_ticker == "RUNES"
         seller_inputs = []
         
         for i, vin in enumerate(tx.get("vin",[])):
@@ -250,24 +248,45 @@ class MarketplaceHeuristicParser:
         return trades
 
     async def discover_trades_in_block(self, block: Dict) -> List[TradeFingerprint]:
-        """Scans a full block to discover all asset trades optimized via batch RPC."""
+        """Scans a full block to discover ALL asset trades dynamically."""
         all_trades = []
-        market_txs = [tx for tx in block.get("tx", []) if self._is_market_maker_signature(tx)]
-        if not market_txs: return []
+        # Filter transactions that look like they have marketplace signatures
+        potential_txs = [tx for tx in block.get("tx", []) if isinstance(tx, dict) and self._is_market_maker_signature(tx)]
+        if not potential_txs: return []
 
-        parent_txids = []
-        for tx in market_txs:
-            for vin in tx.get("vin", []):
-                if "txid" in vin: parent_txids.append(vin["txid"])
-
+        # Prefetch parent transactions for all potential trades to resolve addresses
+        parent_txids = [vin["txid"] for tx in potential_txs for vin in tx.get("vin", []) if "txid" in vin]
         if parent_txids:
             await self.decoder.prefetch_transactions(list(set(parent_txids)))
 
-        for tx in market_txs:
-            # Check for major assets using the validated extraction logic
-            for ticker in ["DOG•GO•TO•THE•MOON", "ORDI", "SATS", "PUPS"]:
-                trades = await self.extract_trades_from_tx(tx, ticker)
-                if trades:
-                    all_trades.extend(trades)
-                    break 
+        for tx in potential_txs:
+            # 1. Try to discover Runes trades dynamically
+            rune_amt = await self.decoder.get_runes_transfer_amount(tx, "") # Empty ticker means "any"
+            if rune_amt:
+                # For Runes, we use a placeholder or detect the ticker from the Runestone if possible.
+                # Standard marketplace trade detection:
+                trades = await self.extract_trades_from_tx(tx, "RUNES") # Generic label for discovered runes
+                if trades: all_trades.extend(trades)
+                continue
+
+            # 2. Try to discover BRC-20 trades dynamically by searching witnesses
+            for vin in tx.get("vin", []):
+                if not self._is_input_market_maker(vin): continue
+                
+                parent_txid = vin.get("txid")
+                if not parent_txid: continue
+                
+                # Check parent witness for BRC-20 transfer 'tick'
+                for witness in vin.get("txinwitness", []):
+                    try:
+                        decoded = binascii.unhexlify(witness).decode('utf-8', errors='ignore')
+                        if '"p":"brc-20"' in decoded and '"op":"transfer"' in decoded:
+                            import re
+                            match = re.search(r'"tick":"([^"]+)"', decoded)
+                            if match:
+                                ticker = match.group(1).upper()
+                                trades = await self.extract_trades_from_tx(tx, ticker)
+                                if trades: all_trades.extend(trades)
+                                break
+                    except: continue
         return all_trades
