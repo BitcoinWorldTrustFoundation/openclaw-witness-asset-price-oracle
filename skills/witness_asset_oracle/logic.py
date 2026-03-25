@@ -106,41 +106,45 @@ class AssetOracleLogic:
                 # Exhaustive L1 discovery
                 trades = await self.engine.parser.discover_trades_in_block(block)
                 
-                # Aggregate volumes
                 top_brc20 = []
                 top_runes = []
                 
                 if trades:
-                    brc20_data = {}
-                    runes_data = {}
+                    # Categories: {"BRC20": {"TICK": {"vol": 0, "sats": 0, "amount": 0}}, "RUNES": {...}}
+                    stats = {"BRC20": {}, "RUNES": {}}
                     
                     for t in trades:
-                        # Safety check: avoid division by zero or negative
                         if t.asset_amount <= 0: continue
                         
-                        vol_btc = t.sats_paid / 10**8
-                        price_usd = (t.sats_paid / t.asset_amount) * (btc_price_cents / 10**8)
+                        target_cat = stats.get(t.asset_type, stats["BRC20"])
+                        if t.asset_ticker not in target_cat:
+                            target_cat[t.asset_ticker] = {"volume_btc": 0, "sats": 0, "amount": 0}
                         
-                        is_rune = "•" in t.asset_ticker or len(t.asset_ticker) > 5 or "dog" in t.asset_ticker.lower()
-                        target_dict = runes_data if is_rune else brc20_data
-                        
-                        if t.asset_ticker not in target_dict:
-                            target_dict[t.asset_ticker] = {"volume_btc": 0, "price_usd": price_usd}
-                        
-                        target_dict[t.asset_ticker]["volume_btc"] += vol_btc
+                        target_cat[t.asset_ticker]["volume_btc"] += t.sats_paid / 10**8
+                        target_cat[t.asset_ticker]["sats"] += t.sats_paid
+                        target_cat[t.asset_ticker]["amount"] += t.asset_amount
                     
-                    # Top 5 Rankings
-                    top_brc20 = sorted(
-                        [{"ticker": k, **v} for k, v in brc20_data.items()],
-                        key=lambda x: x["volume_btc"], reverse=True
-                    )[:5]
+                    # Process Aggregated Data (VWAP and Filtering)
+                    # Min volume: 50,000 sats (0.0005 BTC) to avoid dust/spam in report
+                    MIN_REPORT_VOL_SATS = 50_000 
                     
-                    top_runes = sorted(
-                        [{"ticker": k, **v} for k, v in runes_data.items()],
-                        key=lambda x: x["volume_btc"], reverse=True
-                    )[:5]
+                    processed_brc20 = []
+                    for ticker, data in stats["BRC20"].items():
+                        if data["sats"] < MIN_REPORT_VOL_SATS: continue
+                        price_usd = (data["sats"] / data["amount"]) * (btc_price_cents / 100 / 10**8)
+                        processed_brc20.append({"ticker": ticker, "volume_btc": data["volume_btc"], "price_usd": price_usd})
+
+                    processed_runes = []
+                    for ticker, data in stats["RUNES"].items():
+                        if data["sats"] < MIN_REPORT_VOL_SATS: continue
+                        price_usd = (data["sats"] / data["amount"]) * (btc_price_cents / 100 / 10**8)
+                        processed_runes.append({"ticker": ticker, "volume_btc": data["volume_btc"], "price_usd": price_usd})
+                    
+                    # Top 5 Rankings by volume
+                    top_brc20 = sorted(processed_brc20, key=lambda x: x["volume_btc"], reverse=True)[:5]
+                    top_runes = sorted(processed_runes, key=lambda x: x["volume_btc"], reverse=True)[:5]
                 
-                # Telegram Broadcast (Always post report to show oracle is alive)
+                # Telegram Broadcast
                 await self.telegram.broadcast_top_assets(
                     current_height, btc_price_cents / 100, top_brc20, top_runes
                 )

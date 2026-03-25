@@ -30,16 +30,16 @@ class TelegramReporter:
             msg += "<i>No marketplace activity detected.</i>\n"
         else:
             for i, asset in enumerate(top_brc20, 1):
-                msg += f"{i}. <b>{asset['ticker']}</b>: ${asset['price_usd']:.4f} (Vol: {asset['volume_btc']:.2f} BTC)\n"
+                msg += f"{i}. <b>{asset['ticker']}</b>: ${asset['price_usd']:.6f} (Vol: {asset['volume_btc']:.2f} BTC)\n"
 
         msg += "\n💎 <b>Top 5 Runes (by volume):</b>\n"
         if not top_runes:
             msg += "<i>No marketplace activity detected.</i>\n"
         else:
             for i, rune in enumerate(top_runes, 1):
-                msg += f"{i}. <b>{rune['ticker']}</b>: ${rune['price_usd']:.4f} (Vol: {rune['volume_btc']:.2f} BTC)\n"
+                msg += f"{i}. <b>{rune['ticker']}</b>: ${rune['price_usd']:.6f} (Vol: {rune['volume_btc']:.2f} BTC)\n"
 
-        msg += "\n⚡ <i>Trustless extraction. Zero API. Pure L1 Math.</i>"
+        msg += "\n⚡️ <i>Trustless extraction. Zero API. Pure L1 Math.</i>"
 
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:

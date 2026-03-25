@@ -15,6 +15,7 @@ class TradeFingerprint:
     sats_paid: int
     seller_address: str
     buyer_address: str
+    asset_type: str = "BRC20" # BRC20 or RUNES
 
 class VarIntReader:
     """Utility to read LEB128 encoded integers (VarInts) from Bitcoin script data."""
@@ -33,6 +34,66 @@ class VarIntReader:
                 return res
             shift += 7
         return None
+
+class RuneNameResolver:
+    """
+    Lazy resolver for Rune names (BIP-13).
+    Caches RuneId -> Name mappings to minimize RPC calls.
+    Decodes on-chain integers into human-readable Rune names.
+    """
+    def __init__(self, multi_rpc_provider):
+        self.rpc = multi_rpc_provider
+        # Hardcoded Protocol Constants
+        self.cache: Dict[str, str] = {
+            "1:0": "UNCOMMON•GOODS"
+        }
+
+    def _decode_rune_name(self, n: int) -> str:
+        """Converts a Rune integer (uint128) to its human-readable string (A-Z)."""
+        if n == 0: return "A"
+        name = ""
+        while True:
+            name = chr(ord('A') + (n % 26)) + name
+            if n < 26: break
+            n = (n // 26) - 1
+        return name
+
+    async def resolve_name(self, rune_id: str) -> str:
+        """Fetch etching transaction from L1 and decode the Rune name."""
+        if rune_id in self.cache:
+            return self.cache[rune_id]
+
+        try:
+            height, tx_idx = map(int, rune_id.split(':'))
+            block_hash = await self.rpc.getblockhash(height)
+            block = await self.rpc.getblock(block_hash, 1) # Verbosity 1 for TXIDs
+            
+            if tx_idx >= len(block.get("tx", [])):
+                return f"Rune[{rune_id}]"
+
+            etching_txid = block["tx"][tx_idx]
+            etching_tx = await self.rpc.getrawtransaction(etching_txid, verbose=True)
+            
+            # Find the Etching inside the Runestone
+            for vout in etching_tx.get("vout", []):
+                script_hex = vout.get("scriptPubKey", {}).get("hex", "")
+                if script_hex.startswith("6a5d"):
+                    payload = binascii.unhexlify(script_hex[6:])
+                    reader = VarIntReader(payload)
+                    
+                    # Tags: 4 is RUNE name
+                    while True:
+                        tag = reader.read_varint()
+                        if tag is None or tag == 0: break
+                        val = reader.read_varint()
+                        if tag == 4: # Tag 4 is the Rune name integer in an Etching
+                            name = self._decode_rune_name(val)
+                            self.cache[rune_id] = name
+                            return name
+        except Exception as e:
+            logger.debug(f"Failed to resolve Rune name for {rune_id}: {e}")
+        
+        return f"Rune[{rune_id}]"
 
 class PublicRpcAssetDecoder:
     """
@@ -102,27 +163,25 @@ class PublicRpcAssetDecoder:
             logger.debug(f"BRC-20 decoding error for {parent_txid}: {e}")
             return None
 
-    async def get_runes_transfer_amount(self, tx: Dict, target_ticker: str) -> Optional[int]:
+    async def get_runes_transfer_amount(self, tx: Dict) -> List[Tuple[str, int]]:
         """
-        Parses a Runestone (OP_RETURN 13) to extract the transferred amount (BIP-13).
-        Implements a production-grade VarInt parser for Edicts.
+        Parses a Runestone (OP_RETURN 13) to extract the transferred amounts (BIP-13).
+        Returns a list of (rune_id, amount) tuples.
         """
+        results = []
         for vout in tx.get("vout", []):
             script_hex = vout.get("scriptPubKey", {}).get("hex", "")
             
             # 6a = OP_RETURN, 5d = OP_13 (Runestone)
             if script_hex.startswith("6a5d"):
-                logger.debug(f"Runestone (OP_13) detected in TX {tx.get('txid')}")
-                
-                # Payload starts after 6a5d (2 bytes) and the push-data length byte (1 byte)
-                # Note: For larger push, the length might be more than 1 byte (OP_PUSH_...)
-                # For standard Runestones, it's usually 6a5d <len> <payload>
                 try:
                     payload = binascii.unhexlify(script_hex[6:])
                     reader = VarIntReader(payload)
                     
                     # Parse Runestone Fields (Tags and Values)
                     tags = {}
+                    # Tag 30 = MINT (RuneId being minted)
+                    # Tag 20 = POINTER (Default destination)
                     while True:
                         tag = reader.read_varint()
                         if tag is None or tag == 0: # 0 = End of Tags / Edicts start
@@ -130,26 +189,53 @@ class PublicRpcAssetDecoder:
                         val = reader.read_varint()
                         if val is None: break
                         tags[tag] = val
+                        
+                        # Handle Mint discovery
+                        if tag == 30: # MINT
+                            # Mints usually create a batch (total supply depends on Rune definition)
+                            # For discovery, we can't know the amount without the Rune definition, 
+                            # but we can return the ID.
+                            # Resolve Mint ID from tags (Block:Tx)
+                            # Wait! Tag 30 is the block, next is Tx? No, Tag 30 is block, Tag 31 is Tx.
+                            pass
+                    
+                    if 30 in tags:
+                        block_height = tags[30]
+                        tx_idx = tags.get(31, 0)
+                        results.append((f"{block_height}:{tx_idx}", 0)) # Amount 0 for now
                     
                     # Tag 7 = EDICTS (The actual transfers)
-                    # An edict is a block, tx, amount, output tuple (4 VarInts)
-                    # We look for amounts targeting Output 0 (common for trades)
-                    total_amount = 0
+                    # Every edict is a block, tx, amount, output tuple (4 VarInts, Delta encoded)
+                    block_acc = 0
+                    tx_acc = 0
                     while True:
-                        block = reader.read_varint()
-                        if block is None: break
-                        tx_idx = reader.read_varint()
+                        block_delta = reader.read_varint()
+                        if block_delta is None: break
+                        
+                        tx_delta = reader.read_varint()
                         amount = reader.read_varint()
                         output = reader.read_varint()
                         
-                        if amount:
-                            total_amount += amount
+                        if block_delta == 0:
+                            tx_acc += tx_delta
+                        else:
+                            block_acc += block_delta
+                            tx_acc = tx_delta
                             
-                    if total_amount > 0:
-                        return total_amount
+                        if amount:
+                            rune_id = f"{block_acc}:{tx_acc}"
+                            results.append((rune_id, amount))
                 except Exception as e:
                     logger.error(f"Runestone parsing error: {e}")
-        return None
+            
+            # Check for non-standard marketplace markers (e.g. SATFLOW)
+            elif "534154464c4f57" in script_hex: # "SATFLOW"
+                # This transaction is a market trade but doesn't have a Runestone.
+                # It relies on default moves of Runes in inputs. 
+                # We return a special marker to trigger parent analysis.
+                results.append(("DEFAULT", 0))
+
+        return list(set(results))
 
 class MarketplaceHeuristicParser:
     """
@@ -158,6 +244,7 @@ class MarketplaceHeuristicParser:
     """
     def __init__(self, decoder: PublicRpcAssetDecoder):
         self.decoder = decoder
+        self.rune_resolver = RuneNameResolver(decoder.rpc)
 
     def _is_market_maker_signature(self, tx: Dict) -> bool:
         """Determines if a transaction contains a Seller (Maker) signature via SIGHASH flags."""
@@ -180,14 +267,13 @@ class MarketplaceHeuristicParser:
                 return True
         return False
 
-    async def extract_trades_from_tx(self, tx: Dict, target_ticker: str) -> List[TradeFingerprint]:
+    async def extract_trades_from_tx(self, tx: Dict, target_ticker: str, asset_type: str = "BRC20") -> List[TradeFingerprint]:
         """Identifies trade fingerprints by matching asset transfers with BTC payments."""
         if not self._is_market_maker_signature(tx):
             return []
 
-        # Simple asset type heuristic
-        is_runes = "•" in target_ticker or len(target_ticker) > 5 or "dog" in target_ticker.lower() or target_ticker == "RUNES"
         seller_inputs = []
+        is_runes = (asset_type == "RUNES")
         
         for i, vin in enumerate(tx.get("vin",[])):
             if "txid" not in vin: continue
@@ -196,55 +282,105 @@ class MarketplaceHeuristicParser:
             if not self._is_input_market_maker(vin):
                 continue
                 
-            amt = None
             if is_runes:
-                amt = await self.decoder.get_runes_transfer_amount(tx, target_ticker)
+                runes_transfers = await self.decoder.get_runes_transfer_amount(tx)
+                
+                # Case A: Implicit default moves (e.g. SATFLOW or simple Pointer)
+                if not runes_transfers or any(r[0] == "DEFAULT" for r in runes_transfers):
+                    # We must check what Runes the maker input had in its parent
+                    parent_runes = await self._discover_runes_from_inputs(tx)
+                    for rid, amt in parent_runes:
+                        if target_ticker in ["RUNES", ""] or rid == target_ticker:
+                            addr = await self._resolve_address(vin)
+                            name = await self.rune_resolver.resolve_name(rid)
+                            seller_inputs.append((i, addr, amt, name))
+                
+                # Case B: Explicit Runestone transfers
+                else:
+                    for rune_id, amt in runes_transfers:
+                        # Filter out the DEFAULT marker
+                        if rune_id == "DEFAULT": continue
+                        
+                        if target_ticker in ["RUNES", ""] or rune_id == target_ticker:
+                            addr = await self._resolve_address(vin)
+                            name = await self.rune_resolver.resolve_name(rune_id)
+                            seller_inputs.append((i, addr, amt, name))
+                break # Process Runestones globally per TX
+            
+            # 2. BRC-20 trade discovery
             else:
                 amt = await self.decoder.get_brc20_transfer_amount(vin["txid"], target_ticker)
+                if amt and amt > 0:
+                    addr = await self._resolve_address(vin)
+                    seller_inputs.append((i, addr, amt, target_ticker))
 
-            if amt and amt > 0:
-                # Fallback: if 'prevout' is missing (common on public RPCs), we resolve it from our cache
-                addr = vin.get("prevout", {}).get("scriptPubKey", {}).get("address")
-                if not addr:
-                    parent_txid = vin.get("txid")
-                    if parent_txid:
-                        parent_tx = self.decoder.cache.get(parent_txid)
-                        if parent_tx:
-                            vout_idx = vin.get("vout")
-                            if vout_idx is not None and vout_idx < len(parent_tx.get("vout", [])):
-                                addr = parent_tx["vout"][vout_idx].get("scriptPubKey", {}).get("address")
+        return await self._finalize_trades(tx, seller_inputs, asset_type)
 
-                addr = addr or "unknown"
-                seller_inputs.append((i, addr, amt))
-                if is_runes: break 
+    async def _discover_runes_from_inputs(self, tx: Dict) -> List[Tuple[str, int]]:
+        """Identifies Runes in the inputs by inspecting parent transactions."""
+        runes_found = []
+        for vin in tx.get("vin", []):
+            parent_txid = vin.get("txid")
+            vout_idx = vin.get("vout")
+            if parent_txid:
+                parent_tx = self.decoder.cache.get(parent_txid)
+                if not parent_tx: continue
+                
+                # Check for Runestone in parent targeting THIS vout_idx
+                parent_results = await self.decoder.get_runes_transfer_amount(parent_tx)
+                # TODO: Handle actual edict output matching. 
+                # For now, if parent has Runestones, we assume they flowed to this input.
+                if parent_results:
+                    runes_found.extend(parent_results)
+        return runes_found
 
-        return self._finalize_trades(tx, seller_inputs, target_ticker)
+    async def _resolve_address(self, vin: Dict) -> str:
+        """Resolves the output address for a given input by looking up the parent transaction."""
+        addr = vin.get("prevout", {}).get("scriptPubKey", {}).get("address")
+        if not addr:
+            parent_txid = vin.get("txid")
+            if parent_txid:
+                parent_tx = self.decoder.cache.get(parent_txid)
+                if parent_tx:
+                    vout_idx = vin.get("vout")
+                    if vout_idx is not None and vout_idx < len(parent_tx.get("vout", [])):
+                        addr = parent_tx["vout"][vout_idx].get("scriptPubKey", {}).get("address")
+        return addr or "unknown"
 
-    def _finalize_trades(self, tx: Dict, seller_inputs: List[Tuple], ticker: str) -> List[TradeFingerprint]:
+    async def _finalize_trades(self, tx: Dict, seller_inputs: List[Tuple], asset_type: str) -> List[TradeFingerprint]:
         """Calculates total BTC payment to seller and identifies the counterparty."""
         trades = []
         txid = tx.get("txid", "")
         outputs = tx.get("vout", [])
 
-        for _, seller_addr, asset_amount in seller_inputs:
+        for vin_idx, seller_addr, asset_amount, ticker in seller_inputs:
+            # SIGHASH_SINGLE Heuristic: The payment for input[i] is at output[i]
             sats_paid = 0
-            for vout in outputs:
-                if vout.get("scriptPubKey", {}).get("address") == seller_addr:
-                    sats_paid += int(vout.get("value", 0) * 10**8)
+            if vin_idx < len(outputs):
+                sats_paid = int(outputs[vin_idx].get("value", 0) * 10**8)
+            
+            # Fallback: sum all outputs back to seller address if SIGHASH_SINGLE index was empty
+            if sats_paid == 0:
+                for vout in outputs:
+                    if vout.get("scriptPubKey", {}).get("address") == seller_addr:
+                        sats_paid += int(vout.get("value", 0) * 10**8)
 
             if sats_paid > 0:
                 buyer_addr = "unknown_buyer"
-                for vin in tx.get("vin", []):
-                    addr = vin.get("prevout", {}).get("scriptPubKey", {}).get("address")
-                    if addr and addr != seller_addr:
-                        buyer_addr = addr
-                        break
+                for vin_b in tx.get("vin", []):
+                    # Taker (Buyer) is the one without a SIGHASH_SINGLE signature
+                    if not self._is_input_market_maker(vin_b):
+                        addr = await self._resolve_address(vin_b)
+                        if addr and addr != seller_addr:
+                            buyer_addr = addr
+                            break
 
                 trades.append(TradeFingerprint(
                     txid=txid, asset_ticker=ticker, asset_amount=asset_amount,
-                    sats_paid=sats_paid, seller_address=seller_addr, buyer_address=buyer_addr
+                    sats_paid=sats_paid, seller_address=seller_addr, buyer_address=buyer_addr,
+                    asset_type=asset_type
                 ))
-                logger.debug(f"Trade detected [{ticker}]: {asset_amount} for {sats_paid} sats.")
+                logger.debug(f"Trade detected [{asset_type}:{ticker}]: {asset_amount} units for {sats_paid} sats.")
         return trades
 
     async def discover_trades_in_block(self, block: Dict) -> List[TradeFingerprint]:
@@ -261,32 +397,42 @@ class MarketplaceHeuristicParser:
 
         for tx in potential_txs:
             # 1. Try to discover Runes trades dynamically
-            rune_amt = await self.decoder.get_runes_transfer_amount(tx, "") # Empty ticker means "any"
-            if rune_amt:
-                # For Runes, we use a placeholder or detect the ticker from the Runestone if possible.
-                # Standard marketplace trade detection:
-                trades = await self.extract_trades_from_tx(tx, "RUNES") # Generic label for discovered runes
-                if trades: all_trades.extend(trades)
+            runes_transfers = await self.decoder.get_runes_transfer_amount(tx)
+            if runes_transfers:
+                for rune_id, _ in runes_transfers:
+                    trades = await self.extract_trades_from_tx(tx, rune_id, asset_type="RUNES")
+                    all_trades.extend(trades)
                 continue
 
-            # 2. Try to discover BRC-20 trades dynamically by searching witnesses
+            # 2. Try to discover BRC-20 trades dynamically
             for vin in tx.get("vin", []):
                 if not self._is_input_market_maker(vin): continue
                 
                 parent_txid = vin.get("txid")
                 if not parent_txid: continue
                 
-                # Check parent witness for BRC-20 transfer 'tick'
-                for witness in vin.get("txinwitness", []):
-                    try:
-                        decoded = binascii.unhexlify(witness).decode('utf-8', errors='ignore')
-                        if '"p":"brc-20"' in decoded and '"op":"transfer"' in decoded:
-                            import re
-                            match = re.search(r'"tick":"([^"]+)"', decoded)
-                            if match:
-                                ticker = match.group(1).upper()
-                                trades = await self.extract_trades_from_tx(tx, ticker)
-                                if trades: all_trades.extend(trades)
-                                break
-                    except: continue
+                # Check PRE-FETCHED parent for the BRC-20 transfer 'tick'
+                # The inscription is in the parent (reveal) input witness
+                parent_tx = self.decoder.cache.get(parent_txid)
+                if not parent_tx: continue
+                
+                ticker = self._find_brc20_ticker_in_tx(parent_tx)
+                if ticker:
+                    trades = await self.extract_trades_from_tx(tx, ticker, asset_type="BRC20")
+                    all_trades.extend(trades)
+                    break
         return all_trades
+
+    def _find_brc20_ticker_in_tx(self, tx: Dict) -> Optional[str]:
+        """Scans a transaction's witnesses for BRC-20 transfer JSON."""
+        for vin in tx.get("vin", []):
+            for witness in vin.get("txinwitness", []):
+                try:
+                    decoded = binascii.unhexlify(witness).decode('utf-8', errors='ignore')
+                    if '"p":"brc-20"' in decoded and '"op":"transfer"' in decoded:
+                        import re
+                        match = re.search(r'"tick":"([^"]+)"', decoded)
+                        if match:
+                            return match.group(1).upper().strip()
+                except: continue
+        return None
